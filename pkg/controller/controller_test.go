@@ -17,6 +17,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -441,32 +442,85 @@ func TestControllerClusterRBACSyncConfigNoLeaks(t *testing.T) {
 		"bindings should have been cleaned up")
 }
 
+// TestControllerRBACSyncConfigGrouperError ensures that when the grouper returns an error
+// other than not found, the existing bindings are not deleted.
+func TestControllerRBACSyncConfigGrouperError(t *testing.T) {
+	var (
+		stopCh = make(chan struct{})
+		crsc   = newClusterRBACSyncConfig("grouper-error",
+			[]rbacsyncv1alpha.Membership{
+				newMembership("group0",
+					[]rbacv1.Subject{
+						newUserSubject("user0"),
+						newUserSubject("user1"),
+					}),
+			},
+			[]rbacsyncv1alpha.Binding{
+				// Note that we have group0 binding to role0 and role1.
+				// This will result in two role bindings created.
+				newBinding("group0", "role0", "ClusterRole"),
+				newBinding("group0", "role1", "ClusterRole"),
+			})
+	)
+	defer close(stopCh)
+
+	grouper := stubGrouper{map[string][]grouperResult{
+		"group0": []grouperResult{{nil, errors.New("GCP Error")}},
+	}}
+	ctlr := newTestControllerWithGrouper(t, stopCh, grouper)
+
+	created, err := ctlr.rbacsyncclient.RBACSyncV1alpha().ClusterRBACSyncConfigs().Create(crsc)
+	checks.Err(t, err)
+
+	events := collectEvents(t, ctlr)
+
+	rbs, err := ctlr.kubeclient.RbacV1().ClusterRoleBindings().List(metav1.ListOptions{})
+	checks.Err(t, err)
+
+	expected := makeExpectedClusterRoleBindings(t, created, ctlr.resolveGroups(created.Spec.Memberships))
+	checks.DeepEqual(t, expected, rbs.Items, "created cluster role bindings don't match expected")
+	checks.DeepEqual(t, []string{
+		"Normal ConfigEnqueued ClusterRBACSyncConfig grouper-error enqueued",
+		"Warning BindingError group group0 lookup failed: unknown error fetching group members: Not a Group Not Found Errror",
+		"Warning BindingError group group0 lookup failed: unknown error fetching group members: Not a Group Not Found Errror",
+	}, events, "observed events mismatched")
+}
+
 var (
 	alwaysReady = func() bool { return true }
 )
 
-func newTestController(t *testing.T, stopCh <-chan struct{}) *Controller {
+type grouperResult struct {
+	members []rbacv1.Subject
+	err error
+}
+
+type stubGrouper struct {
+	results map[string][]grouperResult
+}
+
+func (g stubGrouper) Members(group string) ([]rbacv1.Subject, error) {
+	if results, ok := g.results[group]; ok {
+		if len(results) == 0 {
+			delete(g.results, group)
+			return nil, groups.ErrNotFound
+		}
+		result := results[0]
+		g.results[group] = results[1:]
+		return result.members, result.err
+	}
+	return nil, groups.ErrNotFound
+}
+
+func newTestControllerWithGrouper(t *testing.T, stopCh <-chan struct{}, grouper groups.Grouper) *Controller {
 	kubeclient := fake.NewSimpleClientset()
 	rbacsyncclient := rsfake.NewSimpleClientset()
-
-	upstream := groups.GroupMap{
-		// every group0 is augmented with an upstream user
-		"group0": {
-			newUserSubject("upstream0"),
-		},
-		// we also define an upstream group that gets referenced.
-		"upstream": {
-			newUserSubject("upstream0"),
-			newUserSubject("upstream1"),
-			newUserSubject("upstream2"),
-		},
-	}
 
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeclient, 0)
 	informerFactory := informers.NewSharedInformerFactory(rbacsyncclient, 0)
 	ctlr := NewController(
 		kubeclient, rbacsyncclient,
-		upstream,
+		grouper,
 		0, // disable the poller for testing
 		informerFactory.RBACSync().V1alpha().RBACSyncConfigs(),
 		informerFactory.RBACSync().V1alpha().ClusterRBACSyncConfigs(),
@@ -481,6 +535,23 @@ func newTestController(t *testing.T, stopCh <-chan struct{}) *Controller {
 	go ctlr.Run(stopCh)
 
 	return ctlr
+
+}
+
+func newTestController(t *testing.T, stopCh <-chan struct{}) *Controller {
+	upstream := groups.GroupMap{
+		// every group0 is augmented with an upstream user
+		"group0": {
+			newUserSubject("upstream0"),
+		},
+		// we also define an upstream group that gets referenced.
+		"upstream": {
+			newUserSubject("upstream0"),
+			newUserSubject("upstream1"),
+			newUserSubject("upstream2"),
+		},
+	}
+	return newTestControllerWithGrouper(t, stopCh, upstream)
 }
 
 // makeExpectedRoleBindings creates a set of role bindings from the config.
@@ -515,7 +586,8 @@ func makeExpectedRoleBindings(t *testing.T, config *rbacsyncv1alpha.RBACSyncConf
 				// skip non-existent groups
 				continue
 			}
-			t.Fatal(err) // causes test failure for now, but we could look for an event
+			continue
+			//t.Fatal(err) // causes test failure for now, but we could look for an event
 		}
 
 		if len(members) == 0 {
@@ -573,7 +645,8 @@ func makeExpectedClusterRoleBindings(t *testing.T, config *rbacsyncv1alpha.Clust
 				// skip non-existent groups
 				continue
 			}
-			t.Fatal(err) // causes test failure for now, but we could look for an event
+			continue
+			//t.Fatal(err) // causes test failure for now, but we could look for an event
 		}
 
 		if len(members) == 0 {

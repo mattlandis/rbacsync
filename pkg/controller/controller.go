@@ -345,6 +345,8 @@ func (c *Controller) handleConfig(config *rbacsyncv1alpha.RBACSyncConfig) error 
 			continue
 		}
 
+		name := config.Name + "-" + binding.Group + "-" + binding.RoleRef.Name
+
 		members, err := gm.Members(binding.Group)
 		if err != nil {
 			if groups.IsNotFound(err) {
@@ -353,6 +355,9 @@ func (c *Controller) handleConfig(config *rbacsyncv1alpha.RBACSyncConfig) error 
 			} else {
 				c.recorder.Eventf(config, corev1.EventTypeWarning,
 					EventReasonBindingError, "group %v lookup failed: %v", binding.Group, err)
+				// An error occured looking up the groups, it should be marked as active
+				// so the rolebindings are not deleted in the cleanup.
+				active[name] = struct{}{}
 			}
 
 			continue
@@ -365,7 +370,6 @@ func (c *Controller) handleConfig(config *rbacsyncv1alpha.RBACSyncConfig) error 
 			continue
 		}
 
-		name := config.Name + "-" + binding.Group + "-" + binding.RoleRef.Name
 		if _, ok := active[name]; ok {
 			// we've already seen this as part of this loop, so we have a
 			// duplicate configuration. Since we key on config+group+role, the
